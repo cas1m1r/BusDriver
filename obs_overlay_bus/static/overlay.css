@@ -1,0 +1,38 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+  width: 100%;
+  height: 100%;
+}
+
+body {
+  pointer-events: none;
+}
+
+#overlay-root {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: transparent;
+}
+
+.overlay-effect {
+  position: absolute;
+  display: block;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  background: transparent;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+video.overlay-effect,
+img.overlay-effect {
+  opacity: 1;
+}
