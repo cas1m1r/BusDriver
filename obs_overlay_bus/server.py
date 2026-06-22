@@ -17,8 +17,10 @@ from pydantic import BaseModel, Field
 
 try:
     from .obs_scene import OBSSceneState, OBSWebSocketSceneTracker, obs_scene_state_from_env
+    from .persistent_state import RuntimeStateStore
 except ImportError:
     from obs_scene import OBSSceneState, OBSWebSocketSceneTracker, obs_scene_state_from_env
+    from persistent_state import RuntimeStateStore
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -48,6 +50,7 @@ def _env_path(name: str, default: Path, fallback_name: str | None = None) -> Pat
 CONFIG_PATH = _env_path("OBS_OVERLAY_CONFIG", PROJECT_DIR / "config" / "overlays.json", "OVERLAY_CONFIG")
 STATIC_DIR = PROJECT_DIR / "static"
 ASSETS_DIR = PROJECT_DIR / "assets"
+RUNTIME_STATE_PATH = PROJECT_DIR / "runtime" / "state.json"
 
 
 class TriggerRequest(BaseModel):
@@ -57,6 +60,14 @@ class TriggerRequest(BaseModel):
 
 class OverlayEventRequest(BaseModel):
     type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class StateUpdateRequest(BaseModel):
+    value: str
+    command: str | None = None
+    key: str | None = None
+    scene: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -77,6 +88,9 @@ class EffectRegistry:
         self.global_effects: dict[str, dict[str, Any]] = {}
         self.scenes: dict[str, dict[str, dict[str, Any]]] = {}
         self.event_effects: dict[str, str] = {}
+        self.state_commands: dict[str, str] = {}
+        self.scene_state: dict[str, dict[str, dict[str, Any]]] = {}
+        self.scene_components: dict[str, dict[str, dict[str, Any]]] = {}
         self.loaded_at = 0.0
         self._config_mtime = 0.0
         self.reload()
@@ -111,10 +125,29 @@ class EffectRegistry:
             if not isinstance(effect_name, str) or not effect_name:
                 raise RuntimeError(f"Config event_effects.{event_type} must be a non-empty effect name")
 
+        state_commands_raw = raw.get("state_commands", {})
+        if not isinstance(state_commands_raw, dict):
+            raise RuntimeError("Config 'state_commands' must be an object")
+        state_commands: dict[str, str] = {}
+        for command, command_config in state_commands_raw.items():
+            if not isinstance(command, str) or not command:
+                raise RuntimeError("Config 'state_commands' keys must be non-empty strings")
+            if isinstance(command_config, str):
+                state_key = command_config
+            elif isinstance(command_config, dict):
+                state_key = command_config.get("state_key")
+            else:
+                state_key = None
+            if not isinstance(state_key, str) or not state_key:
+                raise RuntimeError(f"Config state_commands.{command} must define state_key")
+            state_commands[command.lower()] = state_key
+
         self._validate_effect_map("effects", effects)
         self._validate_effect_map("global_effects", global_effects)
 
         scenes: dict[str, dict[str, dict[str, Any]]] = {}
+        scene_states: dict[str, dict[str, dict[str, Any]]] = {}
+        scene_components: dict[str, dict[str, dict[str, Any]]] = {}
         for scene_name, scene_config in scenes_raw.items():
             if not isinstance(scene_name, str) or not scene_name:
                 raise RuntimeError("Scene names must be non-empty strings")
@@ -126,10 +159,52 @@ class EffectRegistry:
             self._validate_effect_map(f"scenes.{scene_name}.effects", scene_effects, allow_alias=True)
             scenes[scene_name] = scene_effects
 
+            state_config = scene_config.get("state", {})
+            if not isinstance(state_config, dict):
+                raise RuntimeError(f"Scene '{scene_name}' state must be an object")
+            validated_state: dict[str, dict[str, Any]] = {}
+            for state_key, definition in state_config.items():
+                if not isinstance(state_key, str) or not state_key or not isinstance(definition, dict):
+                    raise RuntimeError(f"Scene '{scene_name}' has an invalid state definition")
+                default = definition.get("default")
+                allowed = definition.get("allowed")
+                if not isinstance(default, str) or not isinstance(allowed, list):
+                    raise RuntimeError(f"Scene '{scene_name}' state '{state_key}' needs default and allowed")
+                if not all(isinstance(value, str) and value for value in allowed) or default not in allowed:
+                    raise RuntimeError(f"Scene '{scene_name}' state '{state_key}' has invalid allowed values")
+                validated_state[state_key] = {"default": default, "allowed": list(allowed)}
+            scene_states[scene_name] = validated_state
+
+            components = scene_config.get("components", {})
+            if not isinstance(components, dict):
+                raise RuntimeError(f"Scene '{scene_name}' components must be an object")
+            validated_components: dict[str, dict[str, Any]] = {}
+            for component_name, component in components.items():
+                if not isinstance(component_name, str) or not component_name or not isinstance(component, dict):
+                    raise RuntimeError(f"Scene '{scene_name}' has an invalid component")
+                if component.get("type") != "media_input":
+                    raise RuntimeError(f"Scene '{scene_name}' component '{component_name}' has unsupported type")
+                obs_input = component.get("obs_input")
+                state_key = component.get("state_key")
+                variants = component.get("variants")
+                if not isinstance(obs_input, str) or not obs_input:
+                    raise RuntimeError(f"Scene '{scene_name}' component '{component_name}' needs obs_input")
+                if state_key not in validated_state:
+                    raise RuntimeError(f"Scene '{scene_name}' component '{component_name}' has unknown state_key")
+                if not isinstance(variants, dict) or not variants:
+                    raise RuntimeError(f"Scene '{scene_name}' component '{component_name}' needs variants")
+                if not all(isinstance(key, str) and isinstance(value, str) and value for key, value in variants.items()):
+                    raise RuntimeError(f"Scene '{scene_name}' component '{component_name}' has invalid variants")
+                validated_components[component_name] = dict(component)
+            scene_components[scene_name] = validated_components
+
         self.effects = effects
         self.global_effects = global_effects
         self.scenes = scenes
         self.event_effects = event_effects
+        self.state_commands = state_commands
+        self.scene_state = scene_states
+        self.scene_components = scene_components
         self.loaded_at = time.time()
         self._config_mtime = config_mtime
 
@@ -189,6 +264,26 @@ class EffectRegistry:
     def effect_for_event(self, event_type: str) -> str:
         return self.event_effects.get(event_type, event_type)
 
+    def state_key_for_command(self, command: str) -> str | None:
+        return self.state_commands.get(command.lower())
+
+    def scene_state_defaults(self, scene: str) -> dict[str, str]:
+        return {
+            key: definition["default"]
+            for key, definition in self.scene_state.get(scene, {}).items()
+        }
+
+    def allowed_state_values(self, scene: str, key: str) -> list[str]:
+        definition = self.scene_state.get(scene, {}).get(key, {})
+        return list(definition.get("allowed", []))
+
+    def components_for_state(self, scene: str, key: str) -> dict[str, dict[str, Any]]:
+        return {
+            name: component
+            for name, component in self.scene_components.get(scene, {}).items()
+            if component.get("state_key") == key
+        }
+
     def effect_defined_in_any_scene(self, name: str) -> bool:
         return any(name in scene_effects for scene_effects in self.scenes.values())
 
@@ -236,6 +331,9 @@ class EffectRegistry:
             "global_effects": self.global_effects,
             "scenes": {scene: {"effects": effects} for scene, effects in self.scenes.items()},
             "event_effects": self.event_effects,
+            "state_commands": self.state_commands,
+            "scene_state": self.scene_state,
+            "scene_components": self.scene_components,
             "loaded_at": self.loaded_at,
             "config": str(self.config_path),
         }
@@ -290,6 +388,7 @@ def encode_sse(event: str, data: dict[str, Any]) -> str:
 registry = EffectRegistry(CONFIG_PATH)
 bus = EventBus()
 obs_state, obs_tracker = obs_scene_state_from_env()
+runtime_state = RuntimeStateStore(RUNTIME_STATE_PATH)
 
 app = FastAPI(title="OBS Overlay Bus")
 app.add_middleware(
@@ -327,6 +426,7 @@ async def root() -> JSONResponse:
             "effects": "/effects",
             "trigger": "/trigger",
             "event": "/event",
+            "state": "/state",
         }
     )
 
@@ -354,6 +454,11 @@ async def status() -> JSONResponse:
 
     scene_state = obs_state.snapshot()
     current_scene = scene_state["current_scene"]
+    current_values = (
+        runtime_state.get_scene(current_scene, registry.scene_state_defaults(current_scene))
+        if current_scene
+        else {}
+    )
     return JSONResponse(
         {
             "ok": True,
@@ -368,10 +473,185 @@ async def status() -> JSONResponse:
             "available_global_effects": registry.global_effect_names(),
             "available_events": registry.event_names(),
             "event_effects": registry.event_effects,
+            "state_commands": registry.state_commands,
+            "current_scene_state": current_values,
+            "current_scene_components": sorted(registry.scene_components.get(current_scene or "", {}).keys()),
             "overlay_clients": await bus.client_count(),
             "effects": registry.all_effect_names(),
             "config": str(registry.config_path),
             "loaded_at": registry.loaded_at,
+        }
+    )
+
+
+def resolve_media_file(src: str) -> Path:
+    if src.startswith("/assets/"):
+        path = ASSETS_DIR / src[len("/assets/") :]
+    else:
+        path = Path(src)
+        if not path.is_absolute():
+            path = PROJECT_DIR / path
+    return path.resolve()
+
+
+async def apply_media_component(
+    scene: str,
+    component_name: str,
+    component: dict[str, Any],
+    value: str,
+) -> dict[str, Any]:
+    variants = component["variants"]
+    src = variants.get(value)
+    if not src:
+        raise RuntimeError(
+            f"Component '{component_name}' in scene '{scene}' has no variant for '{value}'"
+        )
+
+    media_file = resolve_media_file(src)
+    if not media_file.exists():
+        raise FileNotFoundError(f"Media variant does not exist: {media_file}")
+    if obs_tracker is None:
+        raise RuntimeError("OBS WebSocket is not configured")
+    if not obs_state.snapshot()["obs_connected"]:
+        raise RuntimeError("OBS WebSocket is not connected")
+
+    input_name = component["obs_input"]
+    input_settings: dict[str, Any] = {"local_file": str(media_file)}
+    if component.get("loop", True):
+        input_settings["looping"] = True
+
+    await asyncio.to_thread(
+        obs_tracker.request_once,
+        "SetInputSettings",
+        {
+            "inputName": input_name,
+            "inputSettings": input_settings,
+            "overlay": True,
+        },
+    )
+    if component.get("restart", True):
+        await asyncio.to_thread(
+            obs_tracker.request_once,
+            "TriggerMediaInputAction",
+            {
+                "inputName": input_name,
+                "mediaAction": "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART",
+            },
+        )
+
+    return {
+        "component": component_name,
+        "obs_input": input_name,
+        "value": value,
+        "src": src,
+        "file": str(media_file),
+    }
+
+
+@app.get("/state")
+async def get_state(scene: str | None = None) -> JSONResponse:
+    try:
+        registry.reload_if_changed()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    selected_scene = scene or obs_state.snapshot()["current_scene"]
+    if not selected_scene:
+        return JSONResponse({"ok": False, "error": "current_scene_unknown"}, status_code=409)
+    if selected_scene not in registry.scene_state:
+        return JSONResponse(
+            {"ok": False, "error": "scene_has_no_state", "scene": selected_scene},
+            status_code=404,
+        )
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "scene": selected_scene,
+            "state": runtime_state.get_scene(
+                selected_scene,
+                registry.scene_state_defaults(selected_scene),
+            ),
+            "schema": registry.scene_state[selected_scene],
+            "components": registry.scene_components.get(selected_scene, {}),
+        }
+    )
+
+
+@app.post("/state")
+async def set_state(request: StateUpdateRequest) -> JSONResponse:
+    try:
+        registry.reload_if_changed()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scene = request.scene or obs_state.snapshot()["current_scene"]
+    if not scene:
+        return JSONResponse({"ok": False, "error": "current_scene_unknown"}, status_code=409)
+
+    state_key = request.key
+    if request.command:
+        state_key = registry.state_key_for_command(request.command.strip().lower())
+        if not state_key:
+            return JSONResponse(
+                {"ok": False, "error": "unknown_state_command", "command": request.command},
+                status_code=404,
+            )
+    if not state_key:
+        return JSONResponse({"ok": False, "error": "missing_state_key"}, status_code=400)
+
+    allowed = registry.allowed_state_values(scene, state_key)
+    requested_value = request.value.strip()
+    value = next((item for item in allowed if item.lower() == requested_value.lower()), None)
+    if value is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "invalid_state_value",
+                "scene": scene,
+                "key": state_key,
+                "value": requested_value,
+                "allowed": allowed,
+            },
+            status_code=400,
+        )
+
+    applied: list[dict[str, Any]] = []
+    try:
+        for component_name, component in registry.components_for_state(scene, state_key).items():
+            applied.append(await apply_media_component(scene, component_name, component, value))
+    except FileNotFoundError as exc:
+        return JSONResponse(
+            {"ok": False, "error": "media_file_not_found", "detail": str(exc)},
+            status_code=404,
+        )
+    except RuntimeError as exc:
+        return JSONResponse(
+            {"ok": False, "error": "obs_media_update_failed", "detail": str(exc)},
+            status_code=503,
+        )
+
+    values = runtime_state.set_value(scene, state_key, value)
+    await bus.broadcast(
+        "state_changed",
+        {
+            "scene": scene,
+            "key": state_key,
+            "value": value,
+            "state": values,
+            "components": applied,
+            "payload": request.payload,
+            "sent_at": time.time(),
+        },
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "scene": scene,
+            "key": state_key,
+            "value": value,
+            "state": values,
+            "components": applied,
         }
     )
 

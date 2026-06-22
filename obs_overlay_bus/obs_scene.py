@@ -76,6 +76,33 @@ class OBSWebSocketSceneTracker:
         self._thread = threading.Thread(target=self._run, name="obs-scene-tracker", daemon=True)
         self._thread.start()
 
+    def request_once(
+        self,
+        request_type: str,
+        request_data: dict[str, Any] | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        """Run one authenticated OBS request on a short-lived connection."""
+        try:
+            import websocket
+        except ImportError as exc:
+            raise RuntimeError("websocket-client is not installed") from exc
+
+        ws = None
+        try:
+            ws = websocket.create_connection(
+                f"ws://{self.host}:{self.port}", timeout=timeout
+            )
+            self._identify(ws)
+            return self._request(ws, request_type, request_data)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"OBS WebSocket request failed: {exc}") from exc
+        finally:
+            if ws is not None:
+                ws.close()
+
     def _run(self) -> None:
         try:
             import websocket

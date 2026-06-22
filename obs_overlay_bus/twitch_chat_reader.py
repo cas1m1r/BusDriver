@@ -179,6 +179,41 @@ def trigger_overlay_event(event_type: str, payload: dict[str, Any] | None = None
     return False
 
 
+def trigger_overlay_state(
+    command: str,
+    value: str,
+    payload: dict[str, Any] | None = None,
+) -> bool:
+    """Apply a persistent scene-state command through the overlay bus."""
+    try:
+        response = requests.post(
+            f"{OVERLAY_URL}/state",
+            json={"command": command, "value": value, "payload": payload or {}},
+            timeout=6.0,
+        )
+    except requests.RequestException as exc:
+        print(f"[state] update failed: {exc}")
+        return False
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+
+    if response.ok and data.get("ok", False):
+        print(f"[state] {data.get('scene')}.{data.get('key')} = {data.get('value')}")
+        return True
+
+    error = data.get("error", response.text)
+    detail = data.get("detail")
+    allowed = data.get("allowed")
+    suffix = f" detail={detail}" if detail else ""
+    if allowed:
+        suffix += f" allowed={','.join(allowed)}"
+    print(f"[state] rejected {command} {value}: {error}{suffix}")
+    return False
+
+
 class EffectCatalog:
     def __init__(self, config_path: Path, require_asset_exists: bool = True) -> None:
         self.config_path = config_path
@@ -186,10 +221,12 @@ class EffectCatalog:
         self.effects: dict[str, dict[str, Any]] = {}
         self.cheer_exact: dict[int, str] = {}
         self.cheer_minimums: list[tuple[int, str]] = []
+        self.state_commands: set[str] = set()
         self._last_loaded = 0.0
         self._last_effect_names: tuple[str, ...] = ()
         self._last_skipped_names: tuple[str, ...] = ()
         self._last_cheer_rules: tuple[str, ...] = ()
+        self._last_state_commands: tuple[str, ...] = ()
 
     def maybe_reload(self) -> None:
         if time.time() - self._last_loaded >= CATALOG_REFRESH_SEC:
@@ -219,15 +256,18 @@ class EffectCatalog:
 
         self.effects = available
         self._load_cheer_effects(raw)
+        self._load_state_commands(raw)
         self._last_loaded = time.time()
 
         effect_names = tuple(sorted(self.effects))
         skipped_names = tuple(sorted(skipped))
         cheer_rules = self._cheer_rule_labels()
+        state_commands = tuple(sorted(self.state_commands))
         if (
             effect_names != self._last_effect_names
             or skipped_names != self._last_skipped_names
             or cheer_rules != self._last_cheer_rules
+            or state_commands != self._last_state_commands
         ):
             names = ", ".join(effect_names) or "none"
             print(f"[catalog] triggerable effects: {names}")
@@ -235,9 +275,12 @@ class EffectCatalog:
                 print(f"[catalog] skipped missing assets: {', '.join(skipped_names)}")
             if cheer_rules:
                 print(f"[catalog] cheer mappings: {', '.join(cheer_rules)}")
+            if state_commands:
+                print(f"[catalog] state commands: {', '.join('!' + command for command in state_commands)}")
             self._last_effect_names = effect_names
             self._last_skipped_names = skipped_names
             self._last_cheer_rules = cheer_rules
+            self._last_state_commands = state_commands
 
     def _iter_effect_maps(self, raw: dict[str, Any]):
         effects = raw.get("effects", {})
@@ -276,6 +319,14 @@ class EffectCatalog:
                     self._add_cheer_rule(str(rule["bits"]), effect)
                 elif "min_bits" in rule:
                     self._add_cheer_rule(f"{rule['min_bits']}+", effect)
+
+    def _load_state_commands(self, raw: dict[str, Any]) -> None:
+        commands = raw.get("state_commands", {})
+        self.state_commands = {
+            command.lower()
+            for command in commands
+            if isinstance(command, str) and command
+        } if isinstance(commands, dict) else set()
 
     def _add_cheer_rule(self, bits_text: str, effect: Any) -> None:
         if not isinstance(effect, str) or effect not in self.effects:
@@ -363,6 +414,15 @@ class EffectCatalog:
         if fallback in self.effects:
             return fallback
         return None
+
+    def match_state_command(self, message: str) -> tuple[str, str] | None:
+        match = re.match(r"^!([a-z0-9_]+)\s+(.+?)\s*$", message.strip(), re.IGNORECASE)
+        if not match:
+            return None
+        command = match.group(1).lower()
+        if command not in self.state_commands:
+            return None
+        return command, match.group(2).strip()
 
 
 def unescape_irc_tag_value(value: str) -> str:
@@ -576,6 +636,25 @@ def run_chat_reader() -> None:
                             },
                         )
                         last_triggered = now
+                        continue
+
+                    state_command = catalog.match_state_command(message)
+                    if state_command:
+                        command, value = state_command
+                        now = time.time()
+                        if now - last_triggered < GLOBAL_COOLDOWN_SEC:
+                            print("[state] skipped update during reader cooldown")
+                            continue
+                        if trigger_overlay_state(
+                            command,
+                            value,
+                            {
+                                "username": user,
+                                "message": message,
+                                "source": "twitch_chat_reader",
+                            },
+                        ):
+                            last_triggered = now
                         continue
 
                     effects = catalog.match_message(message)
